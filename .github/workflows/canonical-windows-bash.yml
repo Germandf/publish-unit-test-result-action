@@ -1,0 +1,124 @@
+name: Qualify canonical Windows Bash publisher
+on:
+  push:
+    branches: [qualify/canonical-windows-bash]
+  workflow_dispatch:
+permissions:
+  contents: read
+  checks: write
+jobs:
+  clean-publisher:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require clean global Python and record package inventory
+        shell: pwsh
+        run: |
+          python -c "import sys,importlib.util; assert sys.prefix == sys.base_prefix; assert importlib.util.find_spec('github') is None"
+          if ($LASTEXITCODE -ne 0) { throw 'A clean global interpreter is required.' }
+          python -m pip freeze --all | Sort-Object | Set-Content base-before.txt
+          '<testsuite name="canonical-publisher" tests="1" failures="0" errors="0" skipped="0"><testcase classname="PublisherSmoke" name="CanonicalCleanPythonPublishes" time="0.1"/></testsuite>' | Set-Content smoke.xml
+      - name: Publish through canonical dependency
+        id: publish
+        uses: Eternet/publish-unit-test-result-action/windows/bash@8e4fba0549801b6bf00986ede322acebf198625a
+        env:
+          PIP_REQUIRE_VIRTUALENV: 'true'
+        with:
+          files: smoke.xml
+          check_name: Canonical Windows Bash publisher smoke
+          comment_mode: 'off'
+          compare_to_earlier_commit: false
+          action_fail: true
+          action_fail_on_inconclusive: true
+          json_file: smoke-result.json
+          job_summary: true
+      - name: Verify native venv, published check, counts and unchanged global Python
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_JSON: ${{ steps.publish.outputs.json }}
+        run: |
+          & $env:PYTHON_VENV -c "import sys,github; assert sys.prefix != sys.base_prefix"
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher did not use a real populated venv.' }
+          python -c "import sys,importlib.util; assert sys.prefix == sys.base_prefix; assert importlib.util.find_spec('github') is None"
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher changed the base interpreter.' }
+          python -m pip freeze --all | Sort-Object | Set-Content base-after.txt
+          if ((Get-FileHash base-before.txt).Hash -ne (Get-FileHash base-after.txt).Hash) { throw 'Global package inventory changed.' }
+          $result = Get-Content smoke-result.json -Raw | ConvertFrom-Json
+          if ($result.stats.tests -ne 1 -or $result.stats.tests_succ -ne 1 -or $result.stats.tests_fail -ne 0 -or -not $env:PUBLISH_JSON) { throw 'Publisher counts/output are wrong.' }
+          $name = [uri]::EscapeDataString('Canonical Windows Bash publisher smoke')
+          $checks = Invoke-RestMethod -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/check-runs?check_name=$name" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $published = @($checks.check_runs | Where-Object { $_.name -eq 'Canonical Windows Bash publisher smoke' -and $_.conclusion -eq 'success' -and $_.output.summary })
+          if ($published.Count -ne 1) { throw 'Real check with summary was not published.' }
+          Write-Host 'PASS NativeVenvPublishesAndGlobalPythonIsUnchanged'
+  failed-creation:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare a creation-failure shim with real global pip
+        shell: bash
+        run: |
+          python -c 'import sys; assert sys.prefix == sys.base_prefix'
+          python -m pip freeze --all | sort > base-before.txt
+          mkdir -p "$RUNNER_TEMP/publisher-shim"
+          python -c 'import sys; print(sys.executable)' > "$RUNNER_TEMP/publisher-shim/real-python"
+          cat > "$RUNNER_TEMP/publisher-shim/python3" <<'SHIM'
+          #!/usr/bin/env bash
+          set -eu
+          here="$(cd "$(dirname "$0")" && pwd)"
+          real="$(cat "$here/real-python" | tr -d '\r')"
+          if [[ "$1" == '-c' && "$2" == 'import sys; print(sys.executable)' ]]; then
+            echo "$here/python3"
+          elif [[ "$1" == '-m' && ( "$2" == 'venv' || "$2" == 'virtualenv' ) ]]; then
+            echo "$2:42" >> "$here/trace"
+            exit 42
+          elif [[ "$1" == '-m' && "$2" == 'pip' ]]; then
+            set +e
+            "$real" "$@" > "$here/pip-$(wc -l < "$here/trace").log" 2>&1
+            result=$?
+            set -e
+            echo "pip:$result" >> "$here/trace"
+            exit "$result"
+          else
+            "$real" "$@"
+          fi
+          SHIM
+          chmod +x "$RUNNER_TEMP/publisher-shim/python3"
+          cp "$RUNNER_TEMP/publisher-shim/python3" "$RUNNER_TEMP/publisher-shim/python"
+          echo "$RUNNER_TEMP/publisher-shim" >> "$GITHUB_PATH"
+      - name: Canonical creation failure must not install globally or publish success
+        id: rejected
+        continue-on-error: true
+        uses: Eternet/publish-unit-test-result-action/windows/bash@8e4fba0549801b6bf00986ede322acebf198625a
+        env:
+          PIP_REQUIRE_VIRTUALENV: 'true'
+          PIP_NO_INDEX: 'true'
+        with:
+          files: nonexistent.xml
+          comment_mode: 'off'
+          check_run: false
+          job_summary: false
+      - name: Verify both creation failures and blocked global pip
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.rejected.outcome }}
+          ACTION_JSON: ${{ steps.rejected.outputs.json }}
+        run: |
+          test "$ACTION_OUTCOME" = failure
+          test -z "$ACTION_JSON"
+          here="$RUNNER_TEMP/publisher-shim"
+          test "$(grep -c -E '^(virtualenv|venv):42$' "$here/trace")" = 2
+          test "$(grep -c '^pip:3$' "$here/trace")" = 2
+          test "$(grep -l 'Could not find an activated virtualenv' "$here"/pip-*.log | wc -l)" = 2
+          real="$(cat "$here/real-python" | tr -d '\r')"
+          "$real" -m pip freeze --all | sort > base-after.txt
+          diff base-before.txt base-after.txt
+          echo 'PASS FailedCreationBlocksGlobalPipAndCannotPublishSuccess'
